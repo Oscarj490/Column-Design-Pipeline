@@ -1,0 +1,219 @@
+import pandas as pd
+import math
+
+# ---------------------- DESIGN VARIABLES ----------------------
+# FOR TESTING AND VERIFICATION
+# forces = {'A': 80.2, 'B': 80.2, 'C': 66.9, 'D': 66.9}  # CONNECTED BEAM FORCES kN
+# axial_force_above = 0 # AXIAL FORCE FROM COLUMNS ABOVE (kN)
+# column_length = 3.0  # COLUMN HEIGHT (m)
+# type_of_connection = 'PINNED-PINNED'
+# selected_section = "203 x 203 x 46"
+# selected_grade = "S275"
+
+# FOR USER INPUT IN CONSOLE
+forces = {
+    'A': float(input("ENTER BEAM FORCE A (kN): ")),
+    'B': float(input("ENTER BEAM FORCE B (kN): ")),
+    'C': float(input("ENTER BEAM FORCE C (kN): ")),
+    'D': float(input("ENTER BEAM FORCE D (kN): "))
+}
+
+axial_force_above = float(input("ENTER AXIAL COMPRESSION FORCE FROM FLOORS ABOVE (kN): "))
+
+column_length = float(input("ENTER COLUMN LENGTH (m): "))
+type_of_connection = input("ENTER COLUMN CONNECTION TYPE (FIXED-FIXED, PINNED-FIXED, PINNED-PINNED): ")
+selected_section = input("ENTER UC SECTION FROM STEEL BLUE BOOK: ")
+selected_grade = input("ENTER STEEL GRADE (S275 or S355): ")
+
+# ---------------------- STAGE 0: PRE-DESIGN SETUP ----------------------
+# ---------------------- EFFECTIVE LENGTH ----------------------
+
+def get_effective_length(length, connection_type):
+    return {
+        'FIXED-FIXED': 0.7, # BS 5950 TABLE 22
+        'PINNED-FIXED': 0.85, # BS 5950 TABLE 22
+        'PINNED-PINNED': 1.0 # BS 5950 TABLE 22
+    }.get(connection_type, 1.0) * length
+
+Le = get_effective_length(column_length, type_of_connection)
+
+# ---------------------- MATERIAL PROPERTIES ----------------------
+steel_grades = {
+    "S275": {"fy": 275, "E": 210000},   # FOR tf <=16, EN 10025-2 TABLE 7
+    "S355": {"fy": 355, "E": 210000}    # FOR tf <=16, EN 10025-2 TABLE 7
+}
+partial_factors = {"gamma_M0": 1.0, "gamma_M1": 1.0}  # EN1993-1-1 NA2.15
+
+# ---------------------- LOAD UC SECTION DATA FROM STEEL BLUE BOOK ----------------------
+uc_data = pd.read_csv("UC_Clean.csv")
+section = uc_data[uc_data["designation"].str.strip() == selected_section.strip()].iloc[0] # EN 10365 SCI BLUE BOOK
+
+# ---------------------- DESIGN AXIAL FORCE ----------------------
+N_Ed = sum(forces.values()) + axial_force_above
+
+# ---------------------- ECCENTRIC MOMENTS ----------------------
+def get_design_moments(forces, section):
+    h = section["depth"]
+    tw = section["tw"]
+    My_Ed = abs(forces['B'] - forces['D']) * ((h / 2) + 100) * 1e-3 # ACCESS STEEL DOCUMENT SN005
+    Mz_Ed = abs(forces['A'] - forces['C']) * ((tw / 2) + 100) * 1e-3 # ACCESS STEEL DOCUMENT SN005
+    return My_Ed, Mz_Ed
+
+My_Ed, Mz_Ed = get_design_moments(forces, section)
+
+# ---------------------- SLENDERNESS ε ----------------------
+def compute_epsilon(fy):
+    return math.sqrt(235 / fy) # EN 1993-1-1 NA 2.15
+
+epsilon = compute_epsilon(steel_grades[selected_grade]["fy"])
+
+# ---------------------- SECTION CLASSIFICATION ----------------------
+def classify_section(section, epsilon):
+    b, tf, tw, r, d = section["width"], section["tf"], section["tw"], section["r"], section["depth"]
+    ratio_flange = 0.5 * (b - tw - 2 * r) / tf # EN 1993-1-1 NA 2.15
+    ratio_web = d / tw # EN 1993-1-1 NA 2.15
+    flange_limits = {1: 9 * epsilon, 2: 10 * epsilon, 3: 14 * epsilon} # EN 1993-1-1 NA 2.15
+    web_limits = {1: 33 * epsilon, 2: 38 * epsilon, 3: 42 * epsilon} # EN 1993-1-1 NA 2.15
+    flange_class = next((c for c, lim in flange_limits.items() if ratio_flange <= lim), 4)
+    web_class = next((c for c, lim in web_limits.items() if ratio_web <= lim), 4)
+    return flange_class, web_class
+
+flange_class, web_class = classify_section(section, epsilon)
+
+# === PRINT STAGE 0 RESULTS ===
+print("\n=== STAGE 0: PRE-DESIGN CHECKS ===")
+print(f"Effective Length Le: {Le:.2f} m ")
+print(f"Design Axial Force N_Ed: {N_Ed:.2f} kN")
+print(f"Eccentric Moments: My_Ed = {My_Ed:.2f} kNm, Mz_Ed = {Mz_Ed:.2f} kNm")
+print(f"Slenderness ε: {epsilon:.3f}")
+print(f"Section Class: Flange = {flange_class}, Web = {web_class}")
+
+# ---------------------- STAGE 1:AXIAL BUCKLING RESISTANCE ----------------------
+# === STEP 1.1: CALCULATE REFERENCE SLENDERNESS λ₁ ===
+# λ₁ = 93.9 × √(235 / fy) (EN 1993-1-1 EQ. 6.50)
+def get_lambda_1(fy):
+    return 93.9 * math.sqrt(235 / fy)
+
+# === STEP 1.2: CALCULATE NON-DIMENSIONAL SLENDERNESS RATIO λ̄_y FOR BUCKLING ABOUT y-y AXIS ===
+# λ̄ = (Lcr / i) / λ₁ (EN 1993-1-1 6.3.1.2)
+def get_lambda_bar(Lcr, i, lambda_1):
+    return (Lcr / i) / lambda_1
+
+# === STEP 1.3: CALCULATE BUCKLING REDUCTION FACTOR χ ===
+# χ = 1 / [φ + √(φ² - λ̄²)] (EN 1993-1-1 6.3.1.3 EQ. 6.49)
+# φ = 0.5 × [1 + α × (λ̄ - 0.2) + λ̄²] (EN 1993-1-1 6.3.1.2(1))
+# WHERE α IS THE IMPERFECTION FACTOR
+def get_chi(lambda_bar, alpha):
+    phi = 0.5 * (1 + alpha * (lambda_bar - 0.2) + lambda_bar ** 2)
+    return min(1.0, 1 / (phi + math.sqrt(phi**2 - lambda_bar**2)))
+
+# === STEP 1.4: GET IMPERFECTION FACTOR α FROM EN 1993-1-1 TABLES 6.1 AND 6.2 ===
+# EN 1993-1-1 TABLES 6.1 AND 6.2
+def get_alpha(h, b, tf, axis, grade):
+    h_b = h / b
+    if h_b > 1.2:
+        curve = 'a' if axis == 'y' and tf <= 40 else 'b'
+    else:
+        curve = 'b' if axis == 'y' else 'c'
+    if grade.upper() == 'S460': curve = 'a0'
+    return {'a0': 0.13, 'a': 0.21, 'b': 0.34, 'c': 0.49, 'd': 0.76}[curve]
+
+# === STEP 1.5: CALCULATE AXIAL BUCKLING RESISTANCE N_b,Rd ===
+# FORMULA: N_b,Rd = χ × A (mm²) × fy / γM1 (IN kN) (EN 1993-1-1 EQ 6.47)
+def get_NbRd(chi, A_mm2, fy, gamma_M1):
+    return chi * A_mm2 * fy / (gamma_M1 * 1000) # RETURNS IN kN
+
+# === STEP 1.6: CHECK AXIAL UTILISATION AGAINST LIMIT ===
+# VERIFY THAT N_Ed / N_b,Rd ≤ 0.83 (EN 1993-1-1 TABLE 2.1)
+def check_util(N_Ed, NbRd):
+    u = N_Ed / NbRd
+    return u, u <= 0.83
+
+# -- APPLICATION OF BUCKLING RESISTANCE CALCULATIONS --
+
+# -- CONVERT SECTION AREA FROM cm² TO mm² --
+lambda_1 = get_lambda_1(steel_grades[selected_grade]["fy"])
+# -- CONVERT AREA FROM cm² TO mm² (REQUIRED FOR CONSISTENT UNITS) --
+area_mm2 = section["area"] * 100
+
+# -- Y-Y AXIS BUCKLING RESISTANCE --
+# -- CONVERT RADIUS OF GYRATION FROM cm TO mm --
+iy_mm = section["iyy_r"] * 10
+lambda_bar_y = get_lambda_bar(Le * 1000, iy_mm, lambda_1)
+alpha_y = get_alpha(section["depth"], section["width"], section["tf"], 'y', selected_grade)
+chi_y = get_chi(lambda_bar_y, alpha_y)
+NbRd_y = get_NbRd(chi_y, area_mm2, steel_grades[selected_grade]["fy"], partial_factors["gamma_M1"])
+
+# -- Z-Z AXIS BUCKLING RESISTANCE --
+iz_mm = section["izz_r"] * 10
+lambda_bar_z = get_lambda_bar(Le * 1000, iz_mm, lambda_1)
+alpha_z = get_alpha(section["depth"], section["width"], section["tf"], 'z', selected_grade)
+chi_z = get_chi(lambda_bar_z, alpha_z)
+NbRd_z = get_NbRd(chi_z, area_mm2, steel_grades[selected_grade]["fy"], partial_factors["gamma_M1"])
+
+# -- GOVERNING FACTOR: TAKE MINIMUM OF Y-Y AND Z-Z AXIS --
+NbRd_combined = min(NbRd_y, NbRd_z)
+
+# -- UTILISATION CHECK AGAINST 0.83 LIMIT --
+utilisation, passed = check_util(N_Ed, NbRd_combined)
+
+# === PRINT STAGE 1 RESULTS ===
+print("\n=== STAGE 1: AXIAL BUCKLING RESISTANCE ===")
+print(f"Slenderness λ₁ = {lambda_1:.2f}")
+print(f"λ̄_y = {lambda_bar_y:.3f}, χ_y = {chi_y:.3f}, NbRd_y = {NbRd_y:.2f} kN")
+print(f"λ̄_z = {lambda_bar_z:.3f}, χ_z = {chi_z:.3f}, NbRd_z = {NbRd_z:.2f} kN")
+print(f"Minimum Buckling Resistance NbRd_combined = {NbRd_combined:.2f} kN")
+print(f"Utilisation: N_Ed / NbRd = {N_Ed:.2f} / {NbRd_combined:.2f} = {utilisation:.3f}")
+print(f"Status: {'PASS' if passed else 'FAIL'} [Limit ≤ 0.83]")
+
+# ---------------------- STAGE 2: LATERAL TORSIONAL BUCKLING ----------------------
+# === STEP 2.1: CALCULATE NON-DIMENSIONAL SLENDERNESS FOR LTB (λ_LT) ===
+# λ_LT = 0.9 × λ̄_z (Access Steel Document SN008)
+def get_lambda_LT(lambda_bar_z):
+    return 0.9 * lambda_bar_z
+
+# === STEP 2.2: CALCULATE LTB REDUCTION FACTOR χ_LT ===
+# φ_LT = 0.5 × [1 + α_LT × (λ_LT - βλ_LT,0) + βλ²] (EN 1993-1-1 6.3.2.3(1) Eq. 6.57)
+# χ_LT = 1 / [φ_LT + √(φ_LT² - βλ²)] (EN 1993-1-1 6.3.2.3(1) Eq. 6.57)
+def get_chi_LT(lambda_LT, lambda_LT0=0.4, alpha_LT=0.34, beta=0.75): # FROM EN 1993-1-1 6.3.2.3 NA 2.17
+    phi_LT = 0.5 * (1 + (alpha_LT * (lambda_LT - lambda_LT0)) + (beta * lambda_LT ** 2))
+    chi_LT = 1 / (phi_LT + math.sqrt(phi_LT ** 2 - (beta*(lambda_LT ** 2))))
+    return min(1.0, chi_LT)
+
+# === STEP 2.3: CALCULATE LTB MOMENT RESISTANCE M_y,Rd ===
+# M_y,Rd = χ_LT × W_pl,y × fy / γM1 (EN 1993-1-1 6.3.2.1(1))
+def get_MyRd_LTB(chi_LT, Wplyy_cm3, fy, gamma_M1):
+    return chi_LT * Wplyy_cm3 * 1e3 * fy / gamma_M1 / 1e6  # RETURNS in kNm
+
+# -- APPLICATION OF LTB CALCULATIONS --
+lambda_LT = get_lambda_LT(lambda_bar_z)
+chi_LT = get_chi_LT(lambda_LT)
+MyRd_LTB = get_MyRd_LTB(chi_LT, section["wplyy"], steel_grades[selected_grade]["fy"], partial_factors["gamma_M1"])
+
+# === PRINT STAGE 2 RESULTS ===
+print("\n=== STAGE 2: LATERAL TORSIONAL BUCKLING (LTB) ===")
+print(f"λ_LT = {lambda_LT:.3f}")
+print(f"χ_LT = {chi_LT:.3f}")
+print(f"MyRd_LTB = {MyRd_LTB:.2f} kNm")
+
+# ---------------------- STAGE 3: MINOR AXIS MOMENT CAPACITY ----------------------
+# === STEP 3.1: CALCULATE M_z,Rd FOR MINOR AXIS BENDING ===
+# M_z,Rd = W_pl,z × fy / γM1 (ACCESS STEEL DOCUMENT SN048)
+def get_MzRd(Wplzz_cm3, fy, gamma_M1):
+    return Wplzz_cm3 * 1e3 * fy / gamma_M1 / 1e6  # returns in kNm
+
+MzRd = get_MzRd(section["wplzz"], steel_grades[selected_grade]["fy"], partial_factors["gamma_M1"])
+
+# === PRINT STAGE 3 RESULTS ===
+print("\n=== STAGE 3: MINOR AXIS MOMENT CAPACITY ===")
+print(f"MzRd = {MzRd:.2f} kNm")
+
+# ---------------------- FINAL INTERACTION CHECK ----------------------
+interaction = (N_Ed / NbRd_combined) + (My_Ed / MyRd_LTB) + 1.5 * (Mz_Ed / MzRd)
+
+# === PRINT STAGE 4 RESULTS ===
+print("\n=== STAGE 4: FINAL INTERACTION CHECK ===")
+print(f"N_Ed / N_b,Rd     = {N_Ed:.2f} / {NbRd_combined:.2f} = {N_Ed / NbRd_combined:.2f}")
+print(f"My_Ed / MyRd_LTB  = {My_Ed:.2f} / {MyRd_LTB:.2f} = {My_Ed / MyRd_LTB:.2f}")
+print(f"Mz_Ed / MzRd      = {Mz_Ed:.2f} / {MzRd:.2f} = {Mz_Ed / MzRd:.2f}")
+print(f"Combined Check    = {interaction:.2f} {'<= 1.0 PASS' if interaction <= 1.0 else '> 1.0 FAIL'}")
